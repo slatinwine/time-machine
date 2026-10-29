@@ -472,6 +472,24 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
       });
   }
 
+  // 指定日期的「每天60秒读懂世界」存档新闻（约 2024 年底起有存档）
+  // 注意：超出存档范围时 API 会静默回落到最新一期，必须校验返回日期与请求日期一致
+  function fetchNewsByDate(y, m, d) {
+    var ds = y + "-" + (m < 10 ? "0" : "") + m + "-" + (d < 10 ? "0" : "") + d;
+    var key = "news_" + ds;
+    var hit = cacheGet(key);
+    if (hit !== null && hit !== undefined) return Promise.resolve(hit === false ? null : hit);
+    return fetchT("https://60s.viki.moe/v2/60s?date=" + ds, 12000)
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        var v = (j && j.code === 200 && j.data && j.data.news && j.data.news.length && j.data.date === ds)
+          ? j.data : false;
+        cacheSet(key, v);
+        return v === false ? null : v;
+      })
+      .catch(function () { return null; });
+  }
+
   // 微信 24 小时热文榜（今日热榜）
   function fetchWechatHot() {
     var hit = cacheGet("wechat");
@@ -727,18 +745,28 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
 
     fetchEvents(m, d)
       .then(function (data) {
-        els.go.disabled = false;
         data.chosenYear = y;
         state = data;
         data.featured = y ? data.events.filter(function (e) { return e.year === y; }) : [];
-        if (y && !data.featured.length && y <= now.getFullYear()) {
-          setStatus("没找到 <b>" + yearLabel(y) + m + " 月 " + d + " 日</b> 的确切记录，为你展示历史上所有 " + m + " 月 " + d + " 日的大事 ↓");
-        } else {
-          setStatus("");
-        }
-        render();
-        els.trans.disabled = (data.mode === "zh" || !countTranslatable());
-        if (isFuture) aiFuture(m, d, y);
+
+        var fin = function () {
+          els.go.disabled = false;
+          if (y && !data.featured.length && y <= now.getFullYear()) {
+            setStatus("没找到 <b>" + yearLabel(y) + m + " 月 " + d + " 日</b> 的确切大事，为你展示历史上所有 " + m + " 月 " + d + " 日的大事 ↓");
+          } else {
+            setStatus("");
+          }
+          render();
+          els.trans.disabled = (data.mode === "zh" || !countTranslatable());
+          if (isFuture) aiFuture(m, d, y);
+        };
+
+        // 非未来日期：尝试拉取那天的每日新闻存档（2024 年底起有存档）
+        if (isFuture) { fin(); return; }
+        fetchNewsByDate(y || now.getFullYear(), m, d).then(function (news) {
+          data.dailyNews = news;
+          fin();
+        });
       })
       .catch(function (e) {
         els.go.disabled = false;
@@ -768,6 +796,12 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
             return '<div class="featured-item">' + esc(e.text) + linksHtml(e) + "</div>";
           }).join("")
         + "</section>";
+    }
+
+    // 那天的每日新闻存档（近期日期）
+    if (s.dailyNews && s.dailyNews.news) {
+      html += '<div class="news-card today"><div class="date-line">📡 那天的新闻 · 每天 60 秒读懂世界 · ' + esc(s.dailyNews.date) + "</div>"
+        + "<ol>" + s.dailyNews.news.map(function (n) { return "<li>" + esc(n) + "</li>"; }).join("") + "</ol></div>";
     }
 
     html += sectionHtml("大事记", sortByYear(s.events, s.featured));
