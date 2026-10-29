@@ -459,35 +459,58 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
       .then(function (data) { cacheSet(key, data); return data; });
   }
 
-  // 今日新闻（60s API）
+  // 今日新闻（60s API，主域名限流严格，带社区镜像回落）
   function fetchTodayNews() {
     var hit = cacheGet("today");
     if (hit) return Promise.resolve(hit);
-    return fetchT("https://60s.viki.moe/v2/60s", 10000)
-      .then(function (r) { return r.json(); })
-      .then(function (j) {
-        if (j.code !== 200 || !j.data || !j.data.news) throw new Error("bad payload");
-        cacheSet("today", j.data);
-        return j.data;
-      });
+    var sources = [
+      "https://60s.viki.moe/v2/60s",
+      "https://60s.zeabur.app/v2/60s",
+      "https://60api.09cdn.xyz/v2/60s"
+    ];
+    function trySrc(i) {
+      if (i >= sources.length) return Promise.reject(new Error("所有新闻源均不可达"));
+      return fetchT(sources[i], 10000)
+        .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(function (j) {
+          if (!j || j.code !== 200 || !j.data || !j.data.news || !j.data.news.length) throw new Error("bad payload");
+          cacheSet("today", j.data);
+          return j.data;
+        })
+        .catch(function () { return trySrc(i + 1); });
+    }
+    return trySrc(0);
   }
 
   // 指定日期的「每天60秒读懂世界」存档新闻（约 2024 年底起有存档）
-  // 注意：超出存档范围时 API 会静默回落到最新一期，必须校验返回日期与请求日期一致
+  // 底层是按日期命名的静态 JSON，走 GitHub + 多 CDN 分发，无限流；主站 v2 接口仅作末位回落
   function fetchNewsByDate(y, m, d) {
     var ds = y + "-" + (m < 10 ? "0" : "") + m + "-" + (d < 10 ? "0" : "") + d;
     var key = "news_" + ds;
     var hit = cacheGet(key);
     if (hit !== null && hit !== undefined) return Promise.resolve(hit === false ? null : hit);
-    return fetchT("https://60s.viki.moe/v2/60s?date=" + ds, 12000)
-      .then(function (r) { return r.json(); })
-      .then(function (j) {
-        var v = (j && j.code === 200 && j.data && j.data.news && j.data.news.length && j.data.date === ds)
-          ? j.data : false;
-        cacheSet(key, v);
-        return v === false ? null : v;
-      })
-      .catch(function () { return null; });
+
+    var sources = [
+      "https://cdn.jsdmirror.com/gh/vikiboss/60s-static-host@main/static/60s/" + ds + ".json",
+      "https://60s-static.viki.moe/60s/" + ds + ".json",
+      "https://cdn.jsdelivr.net/gh/vikiboss/60s-static-host@main/static/60s/" + ds + ".json",
+      "https://60s.viki.moe/v2/60s?date=" + ds
+    ];
+    function trySrc(i) {
+      if (i >= sources.length) { cacheSet(key, false); return Promise.resolve(null); }
+      return fetchT(sources[i], 10000)
+        .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(function (j) {
+          var data = j && j.data ? j.data : j; // 静态版直接是数据，v2 包在 data 里
+          if (data && data.news && data.news.length && data.date === ds) {
+            cacheSet(key, data);
+            return data;
+          }
+          throw new Error("日期不匹配或无存档");
+        })
+        .catch(function () { return trySrc(i + 1); });
+    }
+    return trySrc(0);
   }
 
   // 微信 24 小时热文榜（今日热榜）
