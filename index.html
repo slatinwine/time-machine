@@ -281,8 +281,7 @@
   <a href="https://zh.wikipedia.org" target="_blank">维基百科</a>（CC BY-SA）·
   今日新闻：<a href="https://github.com/vikiboss/60s" target="_blank">60s API</a> ·
   微信热文：今日热榜 · 翻译：MyMemory<br>
-  AI 播报需要自行配置 OpenAI 兼容接口；输入未来日期时，AI 主播将虚构播报那天的新闻（仅供娱乐）。<br>
-  历史事件与微信热文在本地缓存，重复查看不重复请求。
+  AI 播报：WorkBuddy 云端 AI（正式链接可用）；其它域名访问时可在 AI 设置中配置自定义接口备用；未来播报为 AI 虚构，仅供娱乐。
 </footer>
 
 <script>/* WorkBuddy Cloud SDK (inlined) */
@@ -331,8 +330,13 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
   } catch (e) { cloud = null; }
 
   var cloudModelId = null;
+  // 云端后台有来源白名单：仅应用正式域名与 localhost 放行，其它域名（如 GitHub Pages）会被 403
+  var CANON_HOST = "time-machine-news.app.workbuddy.host";
+  var cloudAllowed = (typeof location !== "undefined") &&
+    (location.hostname === CANON_HOST || location.hostname === "localhost" || location.hostname === "127.0.0.1");
   function resolveCloudModel() {
     if (!cloud) return Promise.reject(new Error("云端 AI 未加载"));
+    if (!cloudAllowed) return Promise.reject(new Error("当前域名不在云端白名单"));
     if (cloudModelId) return Promise.resolve(cloudModelId);
     return cloud.llm.models.list().then(function (models) {
       var m = null;
