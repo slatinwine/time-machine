@@ -727,6 +727,8 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
       f.src = RELAY_ORIGIN + "/?relay=1&sharecode=YMODZSYFLL";
       document.body.appendChild(f);
       relayWin = f;
+      // 立即绑定消息监听：中继 ready 可能在首次 AI 调用之前到达，晚绑会错过
+      if (!relayOnMessageBound) { relayOnMessageBound = true; window.addEventListener("message", relayOnMessage); }
     } catch (e) { relayWin = null; }
     return relayWin;
   }
