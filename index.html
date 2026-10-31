@@ -318,6 +318,63 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
     oauthRelayBaseUrl: "https://www.workbuddy.cn/v2/as/genie-baas/oauth",
     publishableKey: "wbpk_pP8cTJ32BOcnqDblRLAU7K_qxFQpowCEKRSB2ZhSg7IfGzr1zyh3Exq"
   };
+  var CANON_HOST = "time-machine-news.app.workbuddy.host";
+
+  /* ---------------- 中继模式：本页被其它站点（GitHub Pages 等）iframe 时，代为调用云端 AI ----------------
+     背景：云端后台有来源白名单，仅正式域名/localhost 放行。其它域名打开页面时，
+     通过隐藏 iframe 加载正式域名的本页（?relay=1），用 postMessage 转发 AI 请求。 */
+  if (typeof location !== "undefined" && location.search.indexOf("relay=1") >= 0) {
+    document.title = "AI Relay";
+    var relayPost = function (msg) { try { window.parent.postMessage(msg, "*"); } catch (e) {} };
+    var relayCloud = null;
+    try {
+      if (window.WorkBuddyCloud) {
+        relayCloud = WorkBuddyCloud.createWorkBuddyCloud({
+          endpoint: WB_PUBLIC_CONFIG.endpoint,
+          oauthRelayBaseUrl: WB_PUBLIC_CONFIG.oauthRelayBaseUrl,
+          publishableKey: WB_PUBLIC_CONFIG.publishableKey
+        });
+      }
+    } catch (e) { relayCloud = null; }
+
+    var relayModelId = null;
+    function relayModel() {
+      if (relayModelId) return Promise.resolve(relayModelId);
+      return relayCloud.llm.models.list().then(function (models) {
+        var m = null;
+        (models || []).forEach(function (it) { if (!m && it.disabled !== true) m = it; });
+        if (!m) throw new Error("云端暂无可用模型");
+        relayModelId = m.id;
+        return relayModelId;
+      });
+    }
+
+    window.addEventListener("message", function (ev) {
+      var d = ev.data;
+      if (!d || d.type !== "tm-ai-req" || !d.id || !Array.isArray(d.messages) || !relayCloud) return;
+      (async function () {
+        try {
+          var modelId = await relayModel();
+          var stream = relayCloud.llm.chat.completions.create({
+            model: modelId,
+            messages: d.messages,
+            stream: true
+          });
+          for await (const chunk of stream) {
+            const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+            if (delta && delta.content) relayPost({ type: "tm-ai-chunk", id: d.id, text: delta.content });
+          }
+          relayPost({ type: "tm-ai-done", id: d.id });
+        } catch (e) {
+          relayPost({ type: "tm-ai-error", id: d.id, message: (e && ((e.error && e.error.code) || e.message)) || String(e) });
+        }
+      })();
+    });
+
+    relayPost({ type: "tm-ai-ready" });
+    return; // 中继模式到此为止，不启动应用主体
+  }
+
   var cloud = null;
   try {
     if (window.WorkBuddyCloud) {
@@ -331,7 +388,6 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
 
   var cloudModelId = null;
   // 云端后台有来源白名单：仅应用正式域名与 localhost 放行，其它域名（如 GitHub Pages）会被 403
-  var CANON_HOST = "time-machine-news.app.workbuddy.host";
   var cloudAllowed = (typeof location !== "undefined") &&
     (location.hostname === CANON_HOST || location.hostname === "localhost" || location.hostname === "127.0.0.1");
   function resolveCloudModel() {
@@ -623,6 +679,45 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
     });
   }
 
+  /* ---------------- 中继客户端：非白名单域名经正式域名 iframe 调云端 AI ---------------- */
+  var RELAY_ORIGIN = "https://" + CANON_HOST;
+  var relayFrame = null, relayReady = false, relayQueue = [], relayPending = {}, relaySeqN = 0;
+
+  function relayOnMessage(ev) {
+    if (ev.origin !== RELAY_ORIGIN) return;
+    var d = ev.data || {};
+    if (d.type === "tm-ai-ready" && relayFrame) {
+      relayReady = true;
+      relayQueue.splice(0).forEach(function (p) { relayFrame.contentWindow.postMessage(p, RELAY_ORIGIN); });
+      return;
+    }
+    var h = relayPending[d.id];
+    if (!h) return;
+    if (d.type === "tm-ai-chunk") { if (h.onChunk) h.onChunk(d.text); }
+    else if (d.type === "tm-ai-done") { delete relayPending[d.id]; h.resolve(); }
+    else if (d.type === "tm-ai-error") { delete relayPending[d.id]; h.reject(new Error(d.message || "中继调用失败")); }
+  }
+
+  function relayAI(messages, onChunk) {
+    return new Promise(function (resolve, reject) {
+      if (!relayFrame) {
+        relayFrame = document.createElement("iframe");
+        relayFrame.style.cssText = "display:none;width:0;height:0;border:0";
+        relayFrame.src = RELAY_ORIGIN + "/?relay=1&sharecode=YMODZSYFLL";
+        window.addEventListener("message", relayOnMessage);
+        document.body.appendChild(relayFrame);
+      }
+      var id = "r" + (++relaySeqN);
+      relayPending[id] = { onChunk: onChunk, resolve: resolve, reject: reject };
+      var payload = { type: "tm-ai-req", id: id, messages: messages };
+      if (relayReady) relayFrame.contentWindow.postMessage(payload, RELAY_ORIGIN);
+      else relayQueue.push(payload);
+      setTimeout(function () {
+        if (relayPending[id]) { delete relayPending[id]; reject(new Error("中继响应超时")); }
+      }, 90000);
+    });
+  }
+
   // WorkBuddy 云端 LLM 流式播报；失败自动重试 1 次，仍失败由调用方回落
   function errText(e) {
     return (e && ((e.error && e.error.code) || e.message)) || String(e);
@@ -632,23 +727,32 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
     insertAICard(headText, noteHtml);
     var body = document.getElementById("aiBody");
     var out = "";
-    return resolveCloudModel().then(function (modelId) {
-      return (async function () {
-        const stream = cloud.llm.chat.completions.create({
-          model: modelId,
-          messages: messages,
-          stream: true
+    // 非白名单域名（GitHub Pages / 本地 file://）走中继；正式域名直连
+    var useRelay = !cloudAllowed || !cloud;
+    var p = useRelay
+      ? relayAI(messages, function (t) {
+          out += t;
+          body.innerHTML = esc(out) + '<span class="cursor"></span>';
+        })
+      : resolveCloudModel().then(function (modelId) {
+          return (async function () {
+            const stream = cloud.llm.chat.completions.create({
+              model: modelId,
+              messages: messages,
+              stream: true
+            });
+            for await (const chunk of stream) {
+              const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+              if (delta && delta.content) {
+                out += delta.content;
+                body.innerHTML = esc(out) + '<span class="cursor"></span>';
+              }
+            }
+          })();
         });
-        for await (const chunk of stream) {
-          const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
-          if (delta && delta.content) {
-            out += delta.content;
-            body.innerHTML = esc(out) + '<span class="cursor"></span>';
-          }
-        }
-        body.innerHTML = esc(out);
-        document.querySelector("#aiCard .ai-head strong").textContent = doneText;
-      })();
+    return p.then(function () {
+      body.innerHTML = esc(out);
+      document.querySelector("#aiCard .ai-head strong").textContent = doneText;
     }).catch(function (e) {
       if (!isRetry) {
         return new Promise(function (res) { setTimeout(res, 800); })
