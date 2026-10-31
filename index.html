@@ -324,8 +324,16 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
      背景：云端后台有来源白名单，仅正式域名/localhost 放行。其它域名打开页面时，
      通过隐藏 iframe 加载正式域名的本页（?relay=1），用 postMessage 转发 AI 请求。 */
   if (typeof location !== "undefined" && location.search.indexOf("relay=1") >= 0) {
-    document.title = "AI Relay";
-    var relayPost = function (msg) { try { window.parent.postMessage(msg, "*"); } catch (e) {} };
+    document.title = "AI 中继";
+    try {
+      document.body.innerHTML = '<div style="font:13px/1.7 system-ui,sans-serif;padding:16px;color:#444">'
+        + '<b style="font-size:15px">🤖 AI 中继运行中…</b><br>'
+        + '<span style="color:#999">此窗口用于跨域名调用云端 AI，可最小化，请勿关闭。</span></div>';
+    } catch (e) {}
+    var relayPost = function (msg) {
+      var t = window.opener || window.parent;
+      try { t.postMessage(msg, "*"); } catch (e) {}
+    };
     var relayCloud = null;
     try {
       if (window.WorkBuddyCloud) {
@@ -341,8 +349,15 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
     function relayModel() {
       if (relayModelId) return Promise.resolve(relayModelId);
       return relayCloud.llm.models.list().then(function (models) {
+        // 混元 3 优先，低延迟快模型兜底（实测 auto 首字 ~60s，hy3 ~14s，hunyuan-chat ~1-2s）
+        var PREF = ["hy3", "hunyuan-chat", "glm-5.3-flash", "glm-5.2", "glm-4.7"];
         var m = null;
-        (models || []).forEach(function (it) { if (!m && it.disabled !== true) m = it; });
+        for (var i = 0; i < PREF.length && !m; i++) {
+          (models || []).forEach(function (it) {
+            if (!m && it.disabled !== true && it.id === PREF[i]) m = it;
+          });
+        }
+        if (!m) (models || []).forEach(function (it) { if (!m && it.disabled !== true) m = it; });
         if (!m) throw new Error("云端暂无可用模型");
         relayModelId = m.id;
         return relayModelId;
@@ -351,27 +366,34 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
 
     window.addEventListener("message", function (ev) {
       var d = ev.data;
-      if (!d || d.type !== "tm-ai-req" || !d.id || !Array.isArray(d.messages) || !relayCloud) return;
+      console.log("[relay] 收到消息:", d && d.type, d && d.id);
+      if (!d || d.type !== "tm-ai-req" || !d.id || !Array.isArray(d.messages) || !relayCloud) { console.log("[relay] 消息被拒绝"); return; }
       (async function () {
         try {
+          console.log("[relay] LLM: 开始解析模型…");
           var modelId = await relayModel();
+          console.log("[relay] LLM: 模型 =", modelId, "，开始流式调用…");
           var stream = relayCloud.llm.chat.completions.create({
             model: modelId,
             messages: d.messages,
             stream: true
           });
+          var n = 0;
           for await (const chunk of stream) {
             const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
-            if (delta && delta.content) relayPost({ type: "tm-ai-chunk", id: d.id, text: delta.content });
+            if (delta && delta.content) { n++; relayPost({ type: "tm-ai-chunk", id: d.id, text: delta.content }); }
           }
+          console.log("[relay] LLM: 完成，共", n, "个 chunk");
           relayPost({ type: "tm-ai-done", id: d.id });
         } catch (e) {
+          console.log("[relay] LLM: 出错:", String(e && ((e.error && e.error.code) || e.message) || e).slice(0, 150));
           relayPost({ type: "tm-ai-error", id: d.id, message: (e && ((e.error && e.error.code) || e.message)) || String(e) });
         }
       })();
     });
 
     relayPost({ type: "tm-ai-ready" });
+    console.log("[relay] 中继就绪，ready 已发送；cloud:", !!relayCloud);
     return; // 中继模式到此为止，不启动应用主体
   }
 
@@ -395,8 +417,15 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
     if (!cloudAllowed) return Promise.reject(new Error("当前域名不在云端白名单"));
     if (cloudModelId) return Promise.resolve(cloudModelId);
     return cloud.llm.models.list().then(function (models) {
+      // 混元 3 优先，低延迟快模型兜底（实测 auto 首字 ~60s，hy3 ~14s，hunyuan-chat ~1-2s）
+      var PREF = ["hy3", "hunyuan-chat", "glm-5.3-flash", "glm-5.2", "glm-4.7"];
       var m = null;
-      (models || []).forEach(function (it) { if (!m && it.disabled !== true) m = it; });
+      for (var i = 0; i < PREF.length && !m; i++) {
+        (models || []).forEach(function (it) {
+          if (!m && it.disabled !== true && it.id === PREF[i]) m = it;
+        });
+      }
+      if (!m) (models || []).forEach(function (it) { if (!m && it.disabled !== true) m = it; });
       if (!m) throw new Error("云端暂无可用模型");
       cloudModelId = m.id;
       return cloudModelId;
@@ -679,16 +708,27 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
     });
   }
 
-  /* ---------------- 中继客户端：非白名单域名经正式域名 iframe 调云端 AI ---------------- */
+  /* ---------------- 中继客户端：非白名单域名经正式域名弹窗调云端 AI ----------------
+   弹窗是顶层上下文，不受第三方 iframe 的存储/cookie 限制（iframe 实测会被网关挂起）。
+   需在用户手势内 window.open，故在启动/播报按钮点击时预开；被拦截时引导用户点重试。 */
   var RELAY_ORIGIN = "https://" + CANON_HOST;
-  var relayFrame = null, relayReady = false, relayQueue = [], relayPending = {}, relaySeqN = 0;
+  var relayWin = null, relayReady = false, relayQueue = [], relayPending = {}, relaySeqN = 0;
+
+  function ensureRelayWindow() {
+    if (relayWin && !relayWin.closed) return relayWin;
+    try {
+      relayWin = window.open(RELAY_ORIGIN + "/?relay=1&sharecode=YMODZSYFLL", "tm_relay",
+        "popup=yes,width=320,height=150,left=" + Math.max(0, (screen.availWidth || 1200) - 350) + ",top=80");
+    } catch (e) { relayWin = null; }
+    return relayWin;
+  }
 
   function relayOnMessage(ev) {
     if (ev.origin !== RELAY_ORIGIN) return;
     var d = ev.data || {};
-    if (d.type === "tm-ai-ready" && relayFrame) {
+    if (d.type === "tm-ai-ready" && relayWin) {
       relayReady = true;
-      relayQueue.splice(0).forEach(function (p) { relayFrame.contentWindow.postMessage(p, RELAY_ORIGIN); });
+      relayQueue.splice(0).forEach(function (p) { try { relayWin.postMessage(p, RELAY_ORIGIN); } catch (e) {} });
       return;
     }
     var h = relayPending[d.id];
@@ -700,23 +740,21 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
 
   function relayAI(messages, onChunk) {
     return new Promise(function (resolve, reject) {
-      if (!relayFrame) {
-        relayFrame = document.createElement("iframe");
-        relayFrame.style.cssText = "display:none;width:0;height:0;border:0";
-        relayFrame.src = RELAY_ORIGIN + "/?relay=1&sharecode=YMODZSYFLL";
-        window.addEventListener("message", relayOnMessage);
-        document.body.appendChild(relayFrame);
-      }
+      if (relayWin && relayWin.closed) { relayWin = null; relayReady = false; }
+      var w = ensureRelayWindow();
+      if (!w) { reject(new Error("AI 中继窗口被浏览器拦截，请点「重 试」按钮再试")); return; }
+      if (!relayOnMessageBound) { relayOnMessageBound = true; window.addEventListener("message", relayOnMessage); }
       var id = "r" + (++relaySeqN);
       relayPending[id] = { onChunk: onChunk, resolve: resolve, reject: reject };
       var payload = { type: "tm-ai-req", id: id, messages: messages };
-      if (relayReady) relayFrame.contentWindow.postMessage(payload, RELAY_ORIGIN);
+      if (relayReady && !relayWin.closed) { try { relayWin.postMessage(payload, RELAY_ORIGIN); } catch (e) { relayQueue.push(payload); } }
       else relayQueue.push(payload);
       setTimeout(function () {
-        if (relayPending[id]) { delete relayPending[id]; reject(new Error("中继响应超时")); }
-      }, 90000);
+        if (relayPending[id]) { delete relayPending[id]; reject(new Error("中继等待超时（云端响应过慢），请点「重 试」再试")); }
+      }, 240000);
     });
   }
+  var relayOnMessageBound = false;
 
   // WorkBuddy 云端 LLM 流式播报；失败自动重试 1 次，仍失败由调用方回落
   function errText(e) {
@@ -727,6 +765,13 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
     insertAICard(headText, noteHtml);
     var body = document.getElementById("aiBody");
     var out = "";
+    // 云端首字一般 2-5 秒（低延迟模型），极端情况可能更长：头部实时显示已等待时间
+    var t0 = Date.now();
+    var ticker = setInterval(function () {
+      var h = document.querySelector("#aiCard .ai-head strong");
+      if (h) h.textContent = headText + "（已等待 " + Math.round((Date.now() - t0) / 1000) + " 秒）";
+    }, 1000);
+    var stopTicker = function () { clearInterval(ticker); };
     // 非白名单域名（GitHub Pages / 本地 file://）走中继；正式域名直连
     var useRelay = !cloudAllowed || !cloud;
     var p = useRelay
@@ -751,10 +796,13 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
           })();
         });
     return p.then(function () {
+      stopTicker();
       body.innerHTML = esc(out);
       document.querySelector("#aiCard .ai-head strong").textContent = doneText;
     }).catch(function (e) {
-      if (!isRetry) {
+      stopTicker();
+      // 中继超时/被拦截时不要自动重试：叠加请求会让云端排队更慢，改为引导用户手动重试
+      if (!isRetry && !/中继/.test(errText(e))) {
         return new Promise(function (res) { setTimeout(res, 800); })
           .then(function () { return streamCloudAI(messages, headText, doneText, noteHtml, true); });
       }
@@ -789,7 +837,7 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
       { role: "system", content: "你是一位专业的中文新闻主播，播报风格庄重但生动，只依据给定史实播报，不编造细节。" },
       { role: "user", content: buildAIPrompt() }
     ];
-    return streamCloudAI(messages, "AI 主播 · 播报中", "AI 主播 · 播报完毕", "由 WorkBuddy 云端 AI 播报")
+    return streamCloudAI(messages, "AI 主播 · 播报中", "AI 主播 · 播报完毕", "由 WorkBuddy 云端 AI 播报 · 一般几秒内开始出字")
       .catch(function (e) {
         var cfg = getAIConfig();
         if (cfg.base && cfg.key && cfg.model) {
@@ -818,7 +866,7 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
       { role: "system", content: "你是一位中文新闻主播，擅长播报未来新闻：内容为合理虚构的预言，口吻逼真，但本质上属于虚构创作。" },
       { role: "user", content: buildFuturePrompt(m, d, y) }
     ];
-    return streamCloudAI(messages, "AI 未来主播 · 预言生成中", "AI 未来主播 · 播报完毕", "内容由 AI 虚构，仅供娱乐 · WorkBuddy 云端 AI")
+    return streamCloudAI(messages, "AI 未来主播 · 预言生成中", "AI 未来主播 · 播报完毕", "内容由 AI 虚构，仅供娱乐 · WorkBuddy 云端 AI · 一般几秒内开始出字")
       .catch(function (e) {
         var cfg = getAIConfig();
         if (cfg.base && cfg.key && cfg.model) {
@@ -1084,8 +1132,8 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
 
   /* ---------------- 事件绑定 ---------------- */
 
-  els.go.addEventListener("click", go);
-  els.ai.addEventListener("click", aiBroadcast);
+  els.go.addEventListener("click", function () { if (!cloudAllowed) ensureRelayWindow(); go(); });
+  els.ai.addEventListener("click", function () { if (!cloudAllowed) ensureRelayWindow(); aiBroadcast(); });
   els.today.addEventListener("click", goToday);
   els.wechat.addEventListener("click", showWechat);
   els.random.addEventListener("click", goRandom);
