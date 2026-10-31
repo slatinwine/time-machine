@@ -708,17 +708,25 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
     });
   }
 
-  /* ---------------- 中继客户端：非白名单域名经正式域名弹窗调云端 AI ----------------
-   弹窗是顶层上下文，不受第三方 iframe 的存储/cookie 限制（iframe 实测会被网关挂起）。
-   需在用户手势内 window.open，故在启动/播报按钮点击时预开；被拦截时引导用户点重试。 */
+  /* ---------------- 中继客户端：非白名单域名经正式域名隐藏 iframe 调云端 AI ----------------
+   实测已验证：① iframe src 带 sharecode 可过网关（无 X-Frame-Options 限制）；
+   ② 快模型（混元3优先）首字 2-15s，不再触发早期的"响应挂起"误判。
+   iframe 无需用户手势，页面加载时即预建，比弹窗无感且更快。 */
   var RELAY_ORIGIN = "https://" + CANON_HOST;
   var relayWin = null, relayReady = false, relayQueue = [], relayPending = {}, relaySeqN = 0;
 
+  function relayAlive() { return !!(relayWin && relayWin.contentWindow); }
+
   function ensureRelayWindow() {
-    if (relayWin && !relayWin.closed) return relayWin;
+    if (relayAlive()) return relayWin;
     try {
-      relayWin = window.open(RELAY_ORIGIN + "/?relay=1&sharecode=YMODZSYFLL", "tm_relay",
-        "popup=yes,width=320,height=150,left=" + Math.max(0, (screen.availWidth || 1200) - 350) + ",top=80");
+      var f = document.createElement("iframe");
+      f.style.cssText = "position:fixed;left:-20px;top:-20px;width:2px;height:2px;border:0;opacity:0;pointer-events:none;";
+      f.setAttribute("aria-hidden", "true");
+      f.tabIndex = -1;
+      f.src = RELAY_ORIGIN + "/?relay=1&sharecode=YMODZSYFLL";
+      document.body.appendChild(f);
+      relayWin = f;
     } catch (e) { relayWin = null; }
     return relayWin;
   }
@@ -726,9 +734,9 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
   function relayOnMessage(ev) {
     if (ev.origin !== RELAY_ORIGIN) return;
     var d = ev.data || {};
-    if (d.type === "tm-ai-ready" && relayWin) {
+    if (d.type === "tm-ai-ready" && relayAlive()) {
       relayReady = true;
-      relayQueue.splice(0).forEach(function (p) { try { relayWin.postMessage(p, RELAY_ORIGIN); } catch (e) {} });
+      relayQueue.splice(0).forEach(function (p) { try { relayWin.contentWindow.postMessage(p, RELAY_ORIGIN); } catch (e) {} });
       return;
     }
     var h = relayPending[d.id];
@@ -740,14 +748,14 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
 
   function relayAI(messages, onChunk) {
     return new Promise(function (resolve, reject) {
-      if (relayWin && relayWin.closed) { relayWin = null; relayReady = false; }
+      if (!relayAlive()) { relayWin = null; relayReady = false; }
       var w = ensureRelayWindow();
-      if (!w) { reject(new Error("AI 中继窗口被浏览器拦截，请点「重 试」按钮再试")); return; }
+      if (!w) { reject(new Error("AI 中继加载失败，请点「重 试」按钮再试")); return; }
       if (!relayOnMessageBound) { relayOnMessageBound = true; window.addEventListener("message", relayOnMessage); }
       var id = "r" + (++relaySeqN);
       relayPending[id] = { onChunk: onChunk, resolve: resolve, reject: reject };
       var payload = { type: "tm-ai-req", id: id, messages: messages };
-      if (relayReady && !relayWin.closed) { try { relayWin.postMessage(payload, RELAY_ORIGIN); } catch (e) { relayQueue.push(payload); } }
+      if (relayReady && relayAlive()) { try { relayWin.contentWindow.postMessage(payload, RELAY_ORIGIN); } catch (e) { relayQueue.push(payload); } }
       else relayQueue.push(payload);
       setTimeout(function () {
         if (relayPending[id]) { delete relayPending[id]; reject(new Error("中继等待超时（云端响应过慢），请点「重 试」再试")); }
@@ -1130,10 +1138,13 @@ ${l.stack}`)}else c=o?.stack??"";let f=this.url.toString().length;return o?.name
     go();
   }
 
+  // 非白名单域名：页面加载即预建隐藏中继 iframe（无需用户手势），首次 AI 调用零等待
+  if (!cloudAllowed) ensureRelayWindow();
+
   /* ---------------- 事件绑定 ---------------- */
 
-  els.go.addEventListener("click", function () { if (!cloudAllowed) ensureRelayWindow(); go(); });
-  els.ai.addEventListener("click", function () { if (!cloudAllowed) ensureRelayWindow(); aiBroadcast(); });
+  els.go.addEventListener("click", go);
+  els.ai.addEventListener("click", aiBroadcast);
   els.today.addEventListener("click", goToday);
   els.wechat.addEventListener("click", showWechat);
   els.random.addEventListener("click", goRandom);
